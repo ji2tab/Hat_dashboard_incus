@@ -1,0 +1,34 @@
+# mmdvm-dash 設定 (MQTT購読版)
+
+incus:
+  bin: incus            # 母艦の incus 実行パス
+
+# 表示設定
+display:
+  timezone: Asia/Tokyo  # Last heard の時刻表示TZ(JST)
+
+# DMR ID データベース。ID→コールサイン/名前/地域を解決。
+# RadioID.net の user.csv(ヘッダ付きCSV)または dmrid.dat(空白区切り)に対応。
+dmr_ids: /etc/mmdvm-dash/user.csv
+
+# DB 自動更新(任意)。指定時は interval_hours ごとに url から取得して再読込。
+dmr_ids_update:
+  url: https://radioid.net/static/user.csv
+  interval_hours: 24
+
+# 手動の上書き(任意)。DB より優先。DBが誤り/未登録のIDだけ書く。
+callsigns: {}
+#  "4401378": JI2TAB
+
+instances:
+  hat1:
+    label: "hat1 (.172)"
+    container: hat1
+    topic: "host/#"
+    ini: /opt/MMDVMHost/MMDVM-Host.ini
+
+  hat2:
+    label: "hat2 (.173)"
+    container: hat2
+    topic: "host/#"
+    ini: /opt/MMDVMHost/MMDVM-Host.ini
