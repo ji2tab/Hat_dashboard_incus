@@ -31,10 +31,11 @@ from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 
 CONFIG_PATH = os.environ.get("MMDVM_DASH_CONFIG", "/etc/mmdvm-dash/config.yaml")
-MAX_HEARD = 100          # インスタンスごとに保持する Last heard 件数
+APP_VERSION = "1.5.0"    # 1.5.0: 履歴永続化 / info定期再読込 / lost対応 / alias併記 / DB解決 / JST
+MAX_HEARD = 100          # インスタンスごとにメモリ保持する Last heard 件数
 ACTIVE_TIMEOUT = 180     # start 後この秒数 end が来なければ宙吊りとみなし掃除(長い交信を巻き込まない値)
 
-app = FastAPI(title="mmdvm-dash")
+app = FastAPI(title="mmdvm-dash", version=APP_VERSION)
 
 
 def load_config() -> dict:
@@ -48,6 +49,11 @@ def load_config() -> dict:
 CFG = load_config()
 INSTANCES: dict = CFG["instances"]
 INCUS_CFG: dict = CFG.get("incus", {})
+
+# 履歴の永続化。再起動しても直近を復元する。
+HISTORY_DIR = CFG.get("history_dir", "/etc/mmdvm-dash/history")
+HISTORY_KEEP = int(CFG.get("history_keep", 50))            # ディスクに残す件数
+HISTORY_FLUSH_SEC = float(CFG.get("history_flush_sec", 5))  # 変更時の書き出し間隔
 INCUS_BIN = INCUS_CFG.get("bin", "incus")
 
 # 表示タイムゾーン(既定 JST)。systemd の環境に依存せず明示変換する。
@@ -202,7 +208,38 @@ class InstanceState:
         self.last_msg_at = None                 # 最後に MQTT を受けた時刻(監視用)
         self.connected = False
         self.error = None
+        self.rev = 0                            # heard 変更のたびに増える(保存要否判定用)
         self.lock = threading.Lock()
+        self._load_history()
+
+    # ---- 履歴の永続化 -----------------------------------------------
+
+    def _history_path(self):
+        return os.path.join(HISTORY_DIR, f"{self.name}.json")
+
+    def _load_history(self):
+        """起動時にディスクから直近履歴を読み戻す。失敗しても無視。"""
+        try:
+            with open(self._history_path(), encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                # 保存は新しい順。そのまま deque に入れれば左=新しい。
+                self.heard = deque(data[:MAX_HEARD], maxlen=MAX_HEARD)
+        except (OSError, ValueError):
+            pass
+
+    def save_history(self):
+        """heard の先頭 HISTORY_KEEP 件を JSON で原子的に書き出す。"""
+        try:
+            os.makedirs(HISTORY_DIR, exist_ok=True)
+            with self.lock:
+                data = list(self.heard)[:HISTORY_KEEP]
+            tmp = self._history_path() + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False)
+            os.replace(tmp, self._history_path())
+        except OSError:
+            pass
 
     # ---- MQTT メッセージ処理 ----------------------------------------
 
@@ -251,6 +288,7 @@ class InstanceState:
             entry["ended"] = d.get("timestamp", "")
             if append_needed:
                 self.heard.appendleft(entry)
+            self.rev += 1
 
     def _recent_swept(self, slot):
         """タイムアウトで先に落とした未確定エントリを直近から探す(同一 slot)。"""
@@ -274,6 +312,7 @@ class InstanceState:
         for e in self.heard:
             if not e.get("alias"):
                 e["alias"] = value
+                self.rev += 1
                 break
 
     # ---- API 向けスナップショット ----------------------------------
@@ -295,6 +334,7 @@ class InstanceState:
                     tx["ended"] = tx["time"]
                     self.heard.appendleft(tx)
                     self.open_tx.pop(slot, None)
+                    self.rev += 1
                     continue
                 active = {
                     "callsign": format_callsign(tx.get("src_id"), tx.get("alias")),
@@ -482,6 +522,17 @@ def dmr_db_updater():
                 pass
 
 
+def history_flusher():
+    """変更のあったインスタンスの履歴だけを定期的にディスクへ書き出す。"""
+    last_rev = {name: -1 for name in STATES}
+    while True:
+        time.sleep(HISTORY_FLUSH_SEC)
+        for name, state in STATES.items():
+            if state.rev != last_rev.get(name):
+                state.save_history()
+                last_rev[name] = state.rev
+
+
 @app.on_event("startup")
 def start_subscribers():
     for name, state in STATES.items():
@@ -490,6 +541,7 @@ def start_subscribers():
         t.start()
     threading.Thread(target=dmr_db_updater, daemon=True).start()
     threading.Thread(target=station_info_refresher, daemon=True).start()
+    threading.Thread(target=history_flusher, daemon=True).start()
 
 
 # ---------------------------------------------------------------- API
@@ -507,9 +559,14 @@ def api_dmrdb():
         return dict(DMR_DB_INFO)
 
 
+@app.get("/api/version")
+def api_version():
+    return {"version": APP_VERSION}
+
+
 @app.get("/api/instances")
 def api_instances():
-    return {"instances": [
+    return {"version": APP_VERSION, "instances": [
         {"name": n, "label": s.label} for n, s in STATES.items()
     ]}
 
