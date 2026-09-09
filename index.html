@@ -47,6 +47,7 @@
 <body>
 <header>
   <h1>MMDVM DASH</h1>
+  <span class="sub" id="ver"></span>
   <span class="sub" id="clock"></span>
 </header>
 <nav id="tabs"></nav>
@@ -143,6 +144,7 @@ function tick(){ $("clock").textContent = new Date().toLocaleString("ja-JP"); }
   tick(); setInterval(tick, 1000);
   try{
     const data = await getJSON("/api/instances");
+    if (data.version) $("ver").textContent = "v" + data.version;
     instances = data.instances;
     current = instances[0]?.name ?? null;
     renderTabs();
