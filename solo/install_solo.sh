@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# =====================================================================
+#  mmdvm-dash 単独編 インストーラ (母艦編と同一UI / ローカルmosquitto直結)
+#    bash install_solo.sh        # 展開 + venv + 依存 + DB用意
+#    bash install_solo.sh test   # 8080で前景起動して確認 (Ctrl-C停止)
+#  常駐化は最後に表示される sudo 手順を実行。
+# =====================================================================
+set -euo pipefail
+APP_DIR="${APP_DIR:-$HOME/mmdvm-dash}"
+EXPECT_SHA="cfab57e03d57b2986e297f36d341b8be497e763407b3478748d4e482534c2d6f"
+mkdir -p "$APP_DIR"
+
+# 旧・単独版が動いていれば止める
+pkill -f "$APP_DIR/venv/bin/python" 2>/dev/null || true
+
+echo ">> バンドル展開 -> $APP_DIR"
+base64 -d > /tmp/mds_bundle.tgz <<'B64EOF'
+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
+B64EOF
+GOT=$(sha256sum /tmp/mds_bundle.tgz | cut -d' ' -f1)
+[ "$GOT" = "$EXPECT_SHA" ] || { echo "!! SHA256不一致(転送破損)"; echo " exp $EXPECT_SHA"; echo " got $GOT"; exit 1; }
+tar xzf /tmp/mds_bundle.tgz -C "$APP_DIR"
+rm -f "$APP_DIR/main.py" "$APP_DIR/app.py" "$APP_DIR/config.yaml" /tmp/mds_bundle.tgz   # 旧名の残骸を除去
+echo "   SHA256 OK (app_solo.py / static/index.html / config_solo.yaml)"
+
+echo ">> venv + 依存 (fastapi / uvicorn / pyyaml)"
+[ -d "$APP_DIR/venv" ] || python3 -m venv "$APP_DIR/venv"
+"$APP_DIR/venv/bin/pip" install -q --upgrade pip
+"$APP_DIR/venv/bin/pip" install -q fastapi "uvicorn[standard]" pyyaml
+
+echo ">> DMR ID DB (user.csv)"
+if [ ! -f "$APP_DIR/user.csv" ]; then
+  if [ -f "$HOME/.cache/mmdvm-dash/user.csv" ]; then
+    cp "$HOME/.cache/mmdvm-dash/user.csv" "$APP_DIR/user.csv"; echo "   既存キャッシュを流用"
+  else
+    curl -fL https://radioid.net/static/user.csv -o "$APP_DIR/user.csv"; echo "   RadioIDから取得"
+  fi
+fi
+
+if [ "${1:-}" = "test" ]; then
+  echo ">> 前景起動 (Ctrl-Cで停止)  http://192.168.0.62:8080/  /  http://100.108.135.13:8080/"
+  cd "$APP_DIR"
+  exec env MMDVM_DASH_CONFIG="$APP_DIR/config_solo.yaml" ./venv/bin/python -m uvicorn app_solo:app --host 0.0.0.0 --port 8080
+fi
+
+cat <<'MSG'
+
+---------------------------------------------------------------
+セットアップ完了。
+
+[A] 動作確認(前景):   bash install_solo.sh test
+     → http://192.168.0.62:8080/  または  http://100.108.135.13:8080/
+
+[B] 常駐化(systemd, sudo):
+    sudo systemctl disable --now mmdvm-dash-solo 2>/dev/null || true
+    sudo tee /etc/systemd/system/mmdvm-dash-solo.service >/dev/null <<UNIT
+[Unit]
+Description=MMDVM Dashboard (solo)
+After=network-online.target mosquitto.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=asai
+WorkingDirectory=/home/asai/mmdvm-dash
+Environment=MMDVM_DASH_CONFIG=/home/asai/mmdvm-dash/config_solo.yaml
+ExecStart=/home/asai/mmdvm-dash/venv/bin/python -m uvicorn app_solo:app --host 0.0.0.0 --port 8080
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now mmdvm-dash-solo
+    systemctl status mmdvm-dash-solo --no-pager -n 5
+---------------------------------------------------------------
+MSG

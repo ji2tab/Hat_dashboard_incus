@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mmdvm-dash</title>
+<style>
+  :root{
+    --bg:#101418; --panel:#181e24; --panel2:#1f2730; --line:#2b3540;
+    --tx:#d7dee6; --tx2:#8a97a4; --amber:#e8a33d; --green:#4fc07a; --red:#e0605a;
+    --mono:"SFMono-Regular",Consolas,"Noto Sans Mono",monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--tx);
+       font-family:system-ui,"Noto Sans JP",sans-serif;font-size:15px;line-height:1.6}
+  header{display:flex;align-items:baseline;gap:14px;padding:18px 24px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+  header h1{margin:0;font-size:17px;font-weight:600;letter-spacing:.04em}
+  header .sub{color:var(--tx2);font-size:12px;font-family:var(--mono)}
+  nav{display:flex;gap:4px;padding:12px 24px 0;flex-wrap:wrap}
+  nav button{background:none;border:1px solid var(--line);border-bottom:none;color:var(--tx2);
+       padding:7px 18px;border-radius:8px 8px 0 0;font-size:14px;cursor:pointer}
+  nav button.on{background:var(--panel);color:var(--tx);border-color:var(--amber)}
+  main{padding:20px 24px;max-width:960px}
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:20px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px 14px}
+  .card .k{font-size:11px;color:var(--tx2);text-transform:uppercase;letter-spacing:.08em}
+  .card .v{font-size:17px;font-family:var(--mono);margin-top:2px;word-break:break-word}
+  .v.green{color:var(--green)} .v.amber{color:var(--amber)} .v.red{color:var(--red)}
+  .modes{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:20px}
+  .pill{font-size:12px;font-family:var(--mono);padding:2px 10px;border-radius:20px;border:1px solid var(--line);color:var(--tx2)}
+  .pill.en{border-color:var(--green);color:var(--green)}
+  h2{font-size:13px;font-weight:600;color:var(--tx2);text-transform:uppercase;letter-spacing:.1em;margin:0 0 8px}
+  table{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:13px}
+  th{text-align:left;color:var(--tx2);font-weight:400;padding:6px 10px;border-bottom:1px solid var(--line)}
+  td{padding:6px 10px;border-bottom:1px solid var(--panel2)}
+  td.call{color:var(--amber)}
+  td.call .meta{color:var(--tx2);font-size:11px;margin-top:1px}
+  td.num{text-align:right}
+  .src{font-size:11px;padding:1px 7px;border-radius:4px;border:1px solid var(--line);color:var(--tx2)}
+  .src.RF{border-color:var(--green);color:var(--green)}
+  .tag{font-size:10px;color:var(--amber);margin-left:6px}
+  .tag.lost{color:var(--red)}
+  .foot{margin-top:16px;color:var(--tx2);font-size:12px;font-family:var(--mono)}
+  .err{color:var(--red)}
+</style>
+</head>
+<body>
+<header>
+  <h1>MMDVM DASH</h1>
+  <span class="sub" id="clock"></span>
+</header>
+<nav id="tabs"></nav>
+<main>
+  <div class="cards" id="cards"></div>
+  <div class="modes" id="modes"></div>
+  <h2>Last heard</h2>
+  <table>
+    <thead><tr>
+      <th>時刻</th><th>モード</th><th></th><th>コールサイン</th><th>宛先</th>
+      <th style="text-align:right">秒</th><th style="text-align:right">BER%</th>
+    </tr></thead>
+    <tbody id="lh"><tr><td colspan="7" style="color:var(--tx2)">接続中…</td></tr></tbody>
+  </table>
+  <p class="foot" id="foot"></p>
+</main>
+
+<script>
+const POLL_MS = 2000;
+let instances = [], current = null;
+
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const fmt = (v, d) => v == null ? "–" : Number(v).toFixed(d);
+
+async function getJSON(url){
+  const r = await fetch(url);
+  if(!r.ok) throw new Error(`${url} → HTTP ${r.status}`);
+  return r.json();
+}
+
+function renderTabs(){
+  $("tabs").innerHTML = instances.map(i =>
+    `<button class="${i.name===current?'on':''}" onclick="switchTo('${esc(i.name)}')">${esc(i.label)}</button>`
+  ).join("");
+}
+function switchTo(name){ current = name; renderTabs(); refresh(); }
+
+function freq(hz){
+  if(!hz) return "–";
+  const n = Number(hz);
+  return isNaN(n) ? hz : (n/1e6).toFixed(4);
+}
+
+function stateCard(st){
+  if(!st.connected) return {cls:"red", text:"未接続"};
+  if(st.active)     return {cls:"amber", text:`受信中 ${st.active.callsign}`};
+  return {cls:"green", text:"待機中"};
+}
+
+async function refresh(){
+  if(!current) return;
+  try{
+    const [st, lh] = await Promise.all([
+      getJSON(`/api/${current}/status`),
+      getJSON(`/api/${current}/lastheard?limit=20`)
+    ]);
+    const s = stateCard(st);
+    const info = st.info || {};
+    $("cards").innerHTML = `
+      <div class="card"><div class="k">状態</div><div class="v ${s.cls}">${esc(s.text)}</div></div>
+      <div class="card"><div class="k">コールサイン</div><div class="v">${esc(info.callsign ?? "–")}</div></div>
+      <div class="card"><div class="k">周波数 RX/TX</div><div class="v">${esc(freq(info.rx_freq))}<span style="color:var(--tx2)"> / </span>${esc(freq(info.tx_freq))}</div></div>
+      <div class="card"><div class="k">DMR ID</div><div class="v">${esc(info.dmr_id ?? "–")}</div></div>`;
+    const modes = info.modes || {};
+    $("modes").innerHTML = Object.entries(modes).map(([m,en]) =>
+      `<span class="pill ${en?'en':''}">${esc(m)}</span>`).join("");
+    const rows = (lh.lastheard || []).map(e => {
+      const meta = [e.name, e.loc].filter(Boolean).join(" · ");
+      return `
+      <tr>
+        <td>${esc(e.time)}</td>
+        <td>${esc(e.mode)}</td>
+        <td><span class="src ${e.source==='RF'?'RF':''}">${esc(e.source||'NET')}</span></td>
+        <td class="call">${esc(e.callsign)}${e.late?'<span class="tag">late</span>':''}${e.lost?'<span class="tag lost">lost</span>':''}${meta?`<div class="meta">${esc(meta)}</div>`:''}</td>
+        <td>${esc(e.dest)}</td>
+        <td class="num">${fmt(e.duration,1)}</td>
+        <td class="num">${fmt(e.ber_pct,2)}</td>
+      </tr>`;
+    }).join("");
+    $("lh").innerHTML = rows || `<tr><td colspan="7" style="color:var(--tx2)">受信記録はまだありません</td></tr>`;
+    const ago = st.last_msg_ago==null ? "まだ受信なし" : `最終メッセージ ${st.last_msg_ago}s 前`;
+    $("foot").innerHTML = st.error
+      ? `<span class="err">⚠ ${esc(st.error)}</span>`
+      : (st.connected ? `MQTT 接続中 · ${ago}` : "MQTT 未接続");
+  }catch(err){
+    $("foot").innerHTML = `<span class="err">API に接続できません: ${esc(err.message)}</span>`;
+  }
+}
+
+function tick(){ $("clock").textContent = new Date().toLocaleString("ja-JP"); }
+
+(async function init(){
+  tick(); setInterval(tick, 1000);
+  try{
+    const data = await getJSON("/api/instances");
+    instances = data.instances;
+    current = instances[0]?.name ?? null;
+    renderTabs();
+    await refresh();
+    setInterval(refresh, POLL_MS);
+  }catch(err){
+    $("foot").innerHTML = `<span class="err">API に接続できません: ${esc(err.message)}</span>`;
+  }
+})();
+</script>
+</body>
+</html>

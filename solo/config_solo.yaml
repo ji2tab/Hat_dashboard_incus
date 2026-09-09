@@ -1,0 +1,16 @@
+display:
+  timezone: Asia/Tokyo
+dmr_ids: /home/asai/mmdvm-dash/user.csv
+dmr_ids_update:
+  url: https://radioid.net/static/user.csv
+  interval_hours: 24
+callsigns: {}
+instances:
+  jr2dhr:
+    label: "JR2DHR (430.750)"
+    topic: "host/#"
+    mqtt_host: 127.0.0.1
+    mqtt_port: 1883
+    mqtt_user: mmdvm
+    mqtt_pass: mmdvm
+    ini: /opt/MMDVMHost/MMDVM-Host.ini
