@@ -32,7 +32,11 @@ from fastapi.staticfiles import StaticFiles
 
 CONFIG_PATH = os.environ.get("MMDVM_DASH_CONFIG", "/etc/mmdvm-dash/config.yaml")
 MAX_HEARD = 100          # インスタンスごとに保持する Last heard 件数
-ACTIVE_TIMEOUT = 15      # start 後この秒数 end が来なければ待機中に戻す
+# start 後この秒数 end が来なければ「待機中」に戻すセーフティ掃引。
+# 通常の交信は end で確定するので、これは end 欠落時のみの保険。
+# 短すぎると長い交信が「掃引済み(秒=–)」と「?(end)」の2行に割れるため長めにする。
+# config の active_timeout で上書き可。
+ACTIVE_TIMEOUT = 300
 
 app = FastAPI(title="mmdvm-dash")
 
@@ -47,6 +51,8 @@ def load_config() -> dict:
 
 CFG = load_config()
 INSTANCES: dict = CFG["instances"]
+# config で ACTIVE_TIMEOUT を上書き可能にする(既定300秒)
+ACTIVE_TIMEOUT = int(CFG.get("active_timeout", ACTIVE_TIMEOUT))
 
 # 表示タイムゾーン(既定 JST)。systemd の環境に依存せず明示変換する。
 _tz_name = CFG.get("display", {}).get("timezone", "Asia/Tokyo")
