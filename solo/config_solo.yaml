@@ -1,13 +1,21 @@
 display:
   timezone: Asia/Tokyo
+
+# DMR ID DB (RadioID user.csv)。24hごとに自動更新。
 dmr_ids: /home/asai/mmdvm-dash/user.csv
 dmr_ids_update:
   url: https://radioid.net/static/user.csv
   interval_hours: 24
+
+# 手動の上書き(任意)。DBより優先。DBが誤り/未登録のIDだけ書く。
 callsigns: {}
+
+# 監視対象ノード。コールサイン・周波数・DMR ID・有効モードは
+# 下の ini(MMDVM-Host.ini)から自動で読むため、ここには直書きしない。
+# label を省略すると ini のコールサインがタブ名になる。
 instances:
   jr2dhr:
-    label: "JR2DHR (430.750)"
+    # label: "任意の表示名"   # 省略時は ini のコールサインを使用
     topic: "host/#"
     mqtt_host: 127.0.0.1
     mqtt_port: 1883
