@@ -131,6 +131,12 @@ def load_dmr_db(path: str) -> int:
 
 
 _dmr_db_path = CFG.get("dmr_ids")
+# 設定パスが無ければ app_solo.py と同じディレクトリの user.csv を試す
+# (git clone 直下起動など、配置場所が config の絶対パスと異なる場合の保険)
+if _dmr_db_path and not os.path.isfile(_dmr_db_path):
+    _fallback_csv = str(Path(__file__).parent / "user.csv")
+    if os.path.isfile(_fallback_csv):
+        _dmr_db_path = _fallback_csv
 if _dmr_db_path:
     load_dmr_db(_dmr_db_path)
 
@@ -192,7 +198,10 @@ def fmt_time(iso_utc: str) -> str:
 class InstanceState:
     def __init__(self, name: str, cfg: dict):
         self.name = name
-        self.label = cfg.get("label", name)
+        # label は config で明示された時のみ固定。未指定なら ini のコールサインを
+        # 起動時に自動導出する(コールサイン・周波数をソース/設定に直書きしない)。
+        self._label_from_config = bool(cfg.get("label"))
+        self.label = cfg.get("label") or name
         self.heard = deque(maxlen=MAX_HEARD)   # 新しいものが先頭
         self.open_tx = {}                       # slot -> 進行中の start 情報
         self.last_msg_at = None                 # 最後に MQTT を受けた時刻(監視用)
@@ -448,7 +457,13 @@ def dmr_db_updater():
 @app.on_event("startup")
 def start_subscribers():
     for name, state in STATES.items():
-        STATION_INFO[name] = read_station_info(INSTANCES[name])
+        info = read_station_info(INSTANCES[name])
+        STATION_INFO[name] = info
+        # label 未指定なら ini のコールサインをタブ名に採用(直書きを避ける)
+        if not state._label_from_config:
+            cs = (info.get("callsign") or "").strip()
+            if cs:
+                state.label = cs
         t = threading.Thread(target=subscribe_loop, args=(state,), daemon=True)
         t.start()
     threading.Thread(target=dmr_db_updater, daemon=True).start()
@@ -490,4 +505,9 @@ def api_lastheard(name: str, limit: int = 20):
     return {"lastheard": st.snapshot_heard(max(1, min(limit, MAX_HEARD)))}
 
 
-app.mount("/", StaticFiles(directory=Path(__file__).parent / "static", html=True), name="static")
+# 画面(index.html)は static/ を優先し、無ければ app_solo.py と同階層を使う
+# (repo の solo/ 直下に index.html がある構成でも clone 一発で動くように)
+_static_dir = Path(__file__).parent / "static"
+if not (_static_dir / "index.html").is_file():
+    _static_dir = Path(__file__).parent
+app.mount("/", StaticFiles(directory=str(_static_dir), html=True), name="static")
