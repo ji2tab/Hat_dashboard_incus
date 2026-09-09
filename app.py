@@ -32,7 +32,7 @@ from fastapi.staticfiles import StaticFiles
 
 CONFIG_PATH = os.environ.get("MMDVM_DASH_CONFIG", "/etc/mmdvm-dash/config.yaml")
 MAX_HEARD = 100          # インスタンスごとに保持する Last heard 件数
-ACTIVE_TIMEOUT = 15      # start 後この秒数 end が来なければ待機中に戻す
+ACTIVE_TIMEOUT = 180     # start 後この秒数 end が来なければ宙吊りとみなし掃除(長い交信を巻き込まない値)
 
 app = FastAPI(title="mmdvm-dash")
 
@@ -231,19 +231,33 @@ class InstanceState:
             }
         elif action in ("end", "lost"):
             entry = self.open_tx.pop(slot, None)
+            append_needed = entry is not None   # open_tx 由来はまだ heard に無い
             if entry is None:
-                # start を取りこぼした end/lost。最低限の行を作る
+                # open_tx に無い。タイムアウトで先に落とした同一送信が heard にあれば更新
+                entry = self._recent_swept(slot)  # 見つかれば既に heard 内(追加不要)
+            if entry is None:
+                # start を取りこぼした end/lost として最低限の行を新規作成
                 entry = {
                     "time": d.get("timestamp", ""), "mode": f"DMR TS{slot}",
                     "source": "", "src_id": "", "callsign": "?", "dest": "?",
                     "alias": "", "late": False,
                 }
+                append_needed = True
             entry["duration"] = d.get("duration")
             entry["ber"] = d.get("ber")
             entry["loss"] = d.get("loss")           # lost 時はパケットロス%が入る
             entry["lost"] = (action == "lost")
+            entry["swept"] = False                  # 本物の終了で確定
             entry["ended"] = d.get("timestamp", "")
-            self.heard.appendleft(entry)
+            if append_needed:
+                self.heard.appendleft(entry)
+
+    def _recent_swept(self, slot):
+        """タイムアウトで先に落とした未確定エントリを直近から探す(同一 slot)。"""
+        for e in list(self.heard)[:5]:
+            if e.get("swept") and e.get("mode", "").endswith(f"TS{slot}"):
+                return e
+        return None
 
     def _text(self, t: dict):
         """Text メッセージ(talker alias)を別枠で保持する。callsign は上書きしない。
@@ -270,10 +284,14 @@ class InstanceState:
             active = None
             for slot, tx in list(self.open_tx.items()):
                 if now - tx.get("_mono", now) > ACTIVE_TIMEOUT:
-                    # end が来なかった送信。記録に落として active から外す
+                    # end が来なかった送信。記録に落として active から外す。
+                    # swept=True にしておき、後から end が来たら更新できるようにする。
                     tx = {k: v for k, v in tx.items() if k != "_mono"}
                     tx["duration"] = None
                     tx["ber"] = None
+                    tx["loss"] = None
+                    tx["lost"] = False
+                    tx["swept"] = True
                     tx["ended"] = tx["time"]
                     self.heard.appendleft(tx)
                     self.open_tx.pop(slot, None)
@@ -420,6 +438,22 @@ def subscribe_loop(state: InstanceState):
 
 STATION_INFO: dict[str, dict] = {}
 
+# info(ini情報)を定期的に読み直す間隔(秒)。config の display.info_refresh_sec で上書き可。
+INFO_REFRESH_SEC = float(CFG.get("display", {}).get("info_refresh_sec", 600))
+
+
+def station_info_refresher():
+    """各インスタンスの ini を定期的に読み直し、周波数/ID/コールサインの変更に追従する。"""
+    while True:
+        time.sleep(INFO_REFRESH_SEC)
+        for name in list(STATES):
+            try:
+                info = read_station_info(INSTANCES[name])
+                if info:                      # 取得できたときだけ差し替え(コンテナ停止時は保持)
+                    STATION_INFO[name] = info
+            except Exception:  # noqa: BLE001
+                pass
+
 
 def dmr_db_updater():
     """設定間隔ごとに DB をダウンロードして再読み込みする(任意)。"""
@@ -455,6 +489,7 @@ def start_subscribers():
         t = threading.Thread(target=subscribe_loop, args=(state,), daemon=True)
         t.start()
     threading.Thread(target=dmr_db_updater, daemon=True).start()
+    threading.Thread(target=station_info_refresher, daemon=True).start()
 
 
 # ---------------------------------------------------------------- API
