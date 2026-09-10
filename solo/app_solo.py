@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
-"""mmdvm-dash 単独編: MMDVM-Host の MQTT (host/json) を購読して表示するダッシュボード
+"""mmdvm-dash: MMDVM-Host の MQTT (host/json) を購読して表示するダッシュボード
 
-母艦編(incus exec 経由で各コンテナの mosquitto を購読)を、コンテナ非依存の
-「ローカル mosquitto 直結」に差し替えた単独ノード版。API と画面は母艦編と同一。
+母艦(ホスト)で動かし、各コンテナの mosquitto を購読して
+送受信イベントを集約する。ログファイルのパース不要。
 
   GET /api/instances                 インスタンス一覧
   GET /api/{name}/status             現在の状態(受信中/待機中)
   GET /api/{name}/lastheard?limit=N  Last heard(start〜end をまとめたもの)
   GET /                              static/index.html
 
-母艦編との違いはこの2点のみ:
-  - subscribe_loop: `incus exec <c> -- mosquitto_sub` → `mosquitto_sub -h 127.0.0.1 ...`(認証付き)
-  - read_station_info: `incus exec <c> -- cat ini` → ローカルの ini を直接 open
+各コンテナの mosquitto は 127.0.0.1 でしか listen していないことが多いので、
+ローカルの mosquitto に mosquitto_sub で直結して購読する(コンテナ非依存・単独版)。
+(コンテナの mosquitto 設定を一切変えずに済む方式)
 """
 
 import configparser
@@ -31,14 +31,11 @@ from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 
 CONFIG_PATH = os.environ.get("MMDVM_DASH_CONFIG", "/etc/mmdvm-dash/config.yaml")
-MAX_HEARD = 100          # インスタンスごとに保持する Last heard 件数
-# start 後この秒数 end が来なければ「待機中」に戻すセーフティ掃引。
-# 通常の交信は end で確定するので、これは end 欠落時のみの保険。
-# 短すぎると長い交信が「掃引済み(秒=–)」と「?(end)」の2行に割れるため長めにする。
-# config の active_timeout で上書き可。
-ACTIVE_TIMEOUT = 300
+APP_VERSION = "1.9.1"    # 1.9.1: TG変更UX(入力クリア+トースト) / 1.9.0: 起動時TG投げ直し
+MAX_HEARD = 100          # インスタンスごとにメモリ保持する Last heard 件数
+ACTIVE_TIMEOUT = 180     # start 後この秒数 end が来なければ宙吊りとみなし掃除(長い交信を巻き込まない値)
 
-app = FastAPI(title="mmdvm-dash")
+app = FastAPI(title="mmdvm-dash", version=APP_VERSION)
 
 
 def load_config() -> dict:
@@ -51,8 +48,11 @@ def load_config() -> dict:
 
 CFG = load_config()
 INSTANCES: dict = CFG["instances"]
-# config で ACTIVE_TIMEOUT を上書き可能にする(既定300秒)
-ACTIVE_TIMEOUT = int(CFG.get("active_timeout", ACTIVE_TIMEOUT))
+
+# 履歴の永続化。再起動しても直近を復元する。
+HISTORY_DIR = CFG.get("history_dir", "/etc/mmdvm-dash/history")
+HISTORY_KEEP = int(CFG.get("history_keep", 50))            # ディスクに残す件数
+HISTORY_FLUSH_SEC = float(CFG.get("history_flush_sec", 5))  # 変更時の書き出し間隔
 
 # 表示タイムゾーン(既定 JST)。systemd の環境に依存せず明示変換する。
 _tz_name = CFG.get("display", {}).get("timezone", "Asia/Tokyo")
@@ -62,6 +62,7 @@ except Exception:  # noqa: BLE001
     DISPLAY_TZ = None  # フォールバック: システムローカル
 
 # ID → コールサイン対応表(自局など Text が来ない ID を補完)。キーは文字列。
+# config の callsigns は「手動の上書き」。メイン解決は DMRIds.dat から行う。
 CALLSIGN_MAP: dict = {str(k): str(v) for k, v in (CFG.get("callsigns", {}) or {}).items()}
 
 # DMR ID データベース。ID(str) -> {"call","name","loc"}
@@ -137,12 +138,6 @@ def load_dmr_db(path: str) -> int:
 
 
 _dmr_db_path = CFG.get("dmr_ids")
-# 設定パスが無ければ app_solo.py と同じディレクトリの user.csv を試す
-# (git clone 直下起動など、配置場所が config の絶対パスと異なる場合の保険)
-if _dmr_db_path and not os.path.isfile(_dmr_db_path):
-    _fallback_csv = str(Path(__file__).parent / "user.csv")
-    if os.path.isfile(_fallback_csv):
-        _dmr_db_path = _fallback_csv
 if _dmr_db_path:
     load_dmr_db(_dmr_db_path)
 
@@ -204,16 +199,82 @@ def fmt_time(iso_utc: str) -> str:
 class InstanceState:
     def __init__(self, name: str, cfg: dict):
         self.name = name
-        # label は config で明示された時のみ固定。未指定なら ini のコールサインを
-        # 起動時に自動導出する(コールサイン・周波数をソース/設定に直書きしない)。
-        self._label_from_config = bool(cfg.get("label"))
-        self.label = cfg.get("label") or name
+        self.label = cfg.get("label", name)
+        self.container = cfg.get("container")  # solo版では未使用
         self.heard = deque(maxlen=MAX_HEARD)   # 新しいものが先頭
         self.open_tx = {}                       # slot -> 進行中の start 情報
         self.last_msg_at = None                 # 最後に MQTT を受けた時刻(監視用)
+        self.current_tg = None                  # 現在TG(ダッシュ設定 or 受信で確定)
+        self.current_tg_src = None              # "set"(ダッシュ設定) / "rx"(受信)
+        self.current_tg_at = None               # 確定時刻(epoch秒)
         self.connected = False
         self.error = None
+        self.rev = 0                            # heard 変更のたびに増える(保存要否判定用)
         self.lock = threading.Lock()
+        self._load_history()
+        self._load_tg()
+
+    # ---- 履歴の永続化 -----------------------------------------------
+
+    def _history_path(self):
+        return os.path.join(HISTORY_DIR, f"{self.name}.json")
+
+    def _tg_path(self):
+        return os.path.join(HISTORY_DIR, f"{self.name}.tg.json")
+
+    def _load_history(self):
+        """起動時にディスクから直近履歴を読み戻す。失敗しても無視。"""
+        try:
+            with open(self._history_path(), encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                # 保存は新しい順。そのまま deque に入れれば左=新しい。
+                self.heard = deque(data[:MAX_HEARD], maxlen=MAX_HEARD)
+        except (OSError, ValueError):
+            pass
+
+    def _load_tg(self):
+        """起動時に前回の現在TGを読み戻す(再起動しても前回TGから開始)。"""
+        try:
+            with open(self._tg_path(), encoding="utf-8") as f:
+                d = json.load(f)
+            self.current_tg = d.get("tg")
+            self.current_tg_src = d.get("src")
+            self.current_tg_at = d.get("at")
+        except (OSError, ValueError):
+            pass
+
+    def _save_tg(self):
+        """現在TGを永続化(原子的書き込み)。"""
+        try:
+            os.makedirs(HISTORY_DIR, exist_ok=True)
+            tmp = self._tg_path() + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"tg": self.current_tg, "src": self.current_tg_src,
+                           "at": self.current_tg_at}, f)
+            os.replace(tmp, self._tg_path())
+        except OSError:
+            pass
+
+    def set_current_tg(self, tg, src):
+        """現在TGを更新して永続化。src は 'set' か 'rx'。"""
+        self.current_tg = int(tg)
+        self.current_tg_src = src
+        self.current_tg_at = time.time()
+        self._save_tg()
+
+    def save_history(self):
+        """heard の先頭 HISTORY_KEEP 件を JSON で原子的に書き出す。"""
+        try:
+            os.makedirs(HISTORY_DIR, exist_ok=True)
+            with self.lock:
+                data = list(self.heard)[:HISTORY_KEEP]
+            tmp = self._history_path() + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False)
+            os.replace(tmp, self._history_path())
+        except OSError:
+            pass
 
     # ---- MQTT メッセージ処理 ----------------------------------------
 
@@ -230,6 +291,10 @@ class InstanceState:
         action = d.get("action")
         slot = d.get("slot")
         if action in ("start", "late_entry"):
+            dst = d.get("dst_id")
+            if dst is not None and dst != self.current_tg:
+                # 受信TGが現在TGと違う → ネット側で変わった可能性。受信TGで追従。
+                self.set_current_tg(dst, "rx")
             self.open_tx[slot] = {
                 "time": d.get("timestamp", ""),
                 "_mono": time.monotonic(),
@@ -237,24 +302,39 @@ class InstanceState:
                 "source": "RF" if d.get("source") == "rf" else "NET",
                 "src_id": str(d.get("src_id", "")),
                 "callsign": d.get("src_info") or str(d.get("src_id", "?")),
-                "dest": f"TG {d.get('dst_id')}" if d.get("dst_id") is not None else "?",
+                "dest": f"TG {dst}" if dst is not None else "?",
                 "late": action == "late_entry",
             }
         elif action in ("end", "lost"):
             entry = self.open_tx.pop(slot, None)
+            append_needed = entry is not None   # open_tx 由来はまだ heard に無い
             if entry is None:
-                # start を取りこぼした end/lost。最低限の行を作る
+                # open_tx に無い。タイムアウトで先に落とした同一送信が heard にあれば更新
+                entry = self._recent_swept(slot)  # 見つかれば既に heard 内(追加不要)
+            if entry is None:
+                # start を取りこぼした end/lost として最低限の行を新規作成
                 entry = {
                     "time": d.get("timestamp", ""), "mode": f"DMR TS{slot}",
                     "source": "", "src_id": "", "callsign": "?", "dest": "?",
                     "alias": "", "late": False,
                 }
+                append_needed = True
             entry["duration"] = d.get("duration")
             entry["ber"] = d.get("ber")
             entry["loss"] = d.get("loss")           # lost 時はパケットロス%が入る
             entry["lost"] = (action == "lost")
+            entry["swept"] = False                  # 本物の終了で確定
             entry["ended"] = d.get("timestamp", "")
-            self.heard.appendleft(entry)
+            if append_needed:
+                self.heard.appendleft(entry)
+            self.rev += 1
+
+    def _recent_swept(self, slot):
+        """タイムアウトで先に落とした未確定エントリを直近から探す(同一 slot)。"""
+        for e in list(self.heard)[:5]:
+            if e.get("swept") and e.get("mode", "").endswith(f"TS{slot}"):
+                return e
+        return None
 
     def _text(self, t: dict):
         """Text メッセージ(talker alias)を別枠で保持する。callsign は上書きしない。
@@ -271,6 +351,7 @@ class InstanceState:
         for e in self.heard:
             if not e.get("alias"):
                 e["alias"] = value
+                self.rev += 1
                 break
 
     # ---- API 向けスナップショット ----------------------------------
@@ -281,13 +362,18 @@ class InstanceState:
             active = None
             for slot, tx in list(self.open_tx.items()):
                 if now - tx.get("_mono", now) > ACTIVE_TIMEOUT:
-                    # end が来なかった送信。記録に落として active から外す
+                    # end が来なかった送信。記録に落として active から外す。
+                    # swept=True にしておき、後から end が来たら更新できるようにする。
                     tx = {k: v for k, v in tx.items() if k != "_mono"}
                     tx["duration"] = None
                     tx["ber"] = None
+                    tx["loss"] = None
+                    tx["lost"] = False
+                    tx["swept"] = True
                     tx["ended"] = tx["time"]
                     self.heard.appendleft(tx)
                     self.open_tx.pop(slot, None)
+                    self.rev += 1
                     continue
                 active = {
                     "callsign": format_callsign(tx.get("src_id"), tx.get("alias")),
@@ -298,6 +384,11 @@ class InstanceState:
                 "connected": self.connected,
                 "active": active,
                 "error": self.error,
+                "current_tg": self.current_tg,
+                "current_tg_src": self.current_tg_src,
+                "current_tg_age": (
+                    round(time.time() - self.current_tg_at) if self.current_tg_at else None
+                ),
                 "last_msg_ago": (
                     round(time.monotonic() - self.last_msg_at, 1)
                     if self.last_msg_at else None
@@ -338,7 +429,6 @@ STATES: dict[str, InstanceState] = {
 
 # ---------------------------------------------------------------- 局情報(ini)
 # ヘッダ表示用にコールサイン・周波数・DMR ID を ini から一度だけ読む(任意)。
-# 単独編: incus exec を使わず、ローカルの ini を直接読む。
 
 def read_station_info(cfg: dict) -> dict:
     ini_path = cfg.get("ini")
@@ -377,28 +467,28 @@ def read_station_info(cfg: dict) -> dict:
 
 
 # ---------------------------------------------------------------- MQTT 購読
-# 単独編: ローカル mosquitto へ直接 mosquitto_sub を常駐させ、1行ずつ受け取る。
+# 各コンテナで `mosquitto_sub` を常駐させ、1行ずつ受け取る。
 # 出力形式: `-v` なので「host/json {json}」の行が届く。
 
 def subscribe_loop(state: InstanceState):
     inst = INSTANCES[state.name]
+    topic = inst.get("topic", "host/#")
     host = inst.get("mqtt_host", "127.0.0.1")
     port = str(inst.get("mqtt_port", 1883))
     user = inst.get("mqtt_user")
-    pw = inst.get("mqtt_pass")
-    topic = inst.get("topic", "host/#")
+    passwd = inst.get("mqtt_pass")
     while True:
         cmd = ["mosquitto_sub", "-h", host, "-p", port, "-t", topic, "-v"]
         if user:
-            cmd += ["-u", str(user)]
-        if pw:
-            cmd += ["-P", str(pw)]
+            cmd += ["-u", user]
+        if passwd:
+            cmd += ["-P", passwd]
         try:
             proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             )
         except FileNotFoundError:
-            state.error = "'mosquitto_sub' が見つかりません (apt install mosquitto-clients)"
+            state.error = "'mosquitto_sub' が見つかりません(mosquitto-clients 未導入)"
             time.sleep(10)
             continue
 
@@ -432,6 +522,22 @@ def subscribe_loop(state: InstanceState):
 
 STATION_INFO: dict[str, dict] = {}
 
+# info(ini情報)を定期的に読み直す間隔(秒)。config の display.info_refresh_sec で上書き可。
+INFO_REFRESH_SEC = float(CFG.get("display", {}).get("info_refresh_sec", 600))
+
+
+def station_info_refresher():
+    """各インスタンスの ini を定期的に読み直し、周波数/ID/コールサインの変更に追従する。"""
+    while True:
+        time.sleep(INFO_REFRESH_SEC)
+        for name in list(STATES):
+            try:
+                info = read_station_info(INSTANCES[name])
+                if info:                      # 取得できたときだけ差し替え(コンテナ停止時は保持)
+                    STATION_INFO[name] = info
+            except Exception:  # noqa: BLE001
+                pass
+
 
 def dmr_db_updater():
     """設定間隔ごとに DB をダウンロードして再読み込みする(任意)。"""
@@ -460,19 +566,28 @@ def dmr_db_updater():
                 pass
 
 
+def history_flusher():
+    """変更のあったインスタンスの履歴だけを定期的にディスクへ書き出す。"""
+    last_rev = {name: -1 for name in STATES}
+    while True:
+        time.sleep(HISTORY_FLUSH_SEC)
+        for name, state in STATES.items():
+            if state.rev != last_rev.get(name):
+                state.save_history()
+                last_rev[name] = state.rev
+
+
 @app.on_event("startup")
 def start_subscribers():
     for name, state in STATES.items():
-        info = read_station_info(INSTANCES[name])
-        STATION_INFO[name] = info
-        # label 未指定なら ini のコールサインをタブ名に採用(直書きを避ける)
-        if not state._label_from_config:
-            cs = (info.get("callsign") or "").strip()
-            if cs:
-                state.label = cs
+        STATION_INFO[name] = read_station_info(INSTANCES[name])
         t = threading.Thread(target=subscribe_loop, args=(state,), daemon=True)
         t.start()
     threading.Thread(target=dmr_db_updater, daemon=True).start()
+    threading.Thread(target=station_info_refresher, daemon=True).start()
+    threading.Thread(target=history_flusher, daemon=True).start()
+    # 起動時、記録された前回TGを TGIF に投げ直す(別スレッドで。失敗しても起動は続行)
+    threading.Thread(target=restore_tg_on_startup, daemon=True).start()
 
 
 # ---------------------------------------------------------------- API
@@ -490,9 +605,14 @@ def api_dmrdb():
         return dict(DMR_DB_INFO)
 
 
+@app.get("/api/version")
+def api_version():
+    return {"version": APP_VERSION}
+
+
 @app.get("/api/instances")
 def api_instances():
-    return {"instances": [
+    return {"version": APP_VERSION, "instances": [
         {"name": n, "label": s.label} for n, s in STATES.items()
     ]}
 
@@ -511,9 +631,58 @@ def api_lastheard(name: str, limit: int = 20):
     return {"lastheard": st.snapshot_heard(max(1, min(limit, MAX_HEARD)))}
 
 
-# 画面(index.html)は static/ を優先し、無ければ app_solo.py と同階層を使う
-# (repo の solo/ 直下に index.html がある構成でも clone 一発で動くように)
-_static_dir = Path(__file__).parent / "static"
-if not (_static_dir / "index.html").is_file():
-    _static_dir = Path(__file__).parent
-app.mount("/", StaticFiles(directory=str(_static_dir), html=True), name="static")
+# TGIF の HTTP API で TG を変更する(TGIFChanger と同じ方式)。
+# GET {tgif_api}/{dmr_id}/{slot_idx}/{tg}   slot_idx: Slot1=0, Slot2=1
+TGIF_API = CFG.get("tgif_api", "http://tgif.network:5040/api/sessions/update").rstrip("/")
+TGIF_API_TIMEOUT = float(CFG.get("tgif_api_timeout", 10))
+
+
+def tgif_push(dmr_id, tg: int, slot: int = 2):
+    """TGIF API に TG 設定を GET で投げる。(ok, http/理由) を返す。例外は投げない。"""
+    import urllib.request
+    import urllib.error
+    url = f"{TGIF_API}/{dmr_id}/{slot - 1}/{tg}"
+    try:
+        req = urllib.request.Request(url, method="GET",
+                                     headers={"User-Agent": "mmdvm-dash"})
+        with urllib.request.urlopen(req, timeout=TGIF_API_TIMEOUT) as res:
+            return (200 <= res.status < 300), res.status
+    except urllib.error.HTTPError as e:
+        return False, e.code
+    except (urllib.error.URLError, OSError) as e:
+        return False, str(getattr(e, "reason", e))
+
+
+@app.get("/api/{name}/set_tg")
+def api_set_tg(name: str, tg: int, slot: int = 2):
+    st = get_state(name)
+    dmr_id = (STATION_INFO.get(name) or {}).get("dmr_id")
+    if not dmr_id:
+        raise HTTPException(400, "DMR ID unknown (ini 未取得)")
+    if slot not in (1, 2):
+        raise HTTPException(400, "slot must be 1 or 2")
+    if tg < 0:
+        raise HTTPException(400, "invalid tg")
+    ok, info = tgif_push(dmr_id, tg, slot)
+    if ok:
+        st.set_current_tg(tg, "set")   # ダッシュ設定を現在TGとして即反映+永続化
+        return {"ok": True, "http": info, "tg": tg, "slot": slot, "dmr_id": dmr_id}
+    if isinstance(info, int):
+        return {"ok": False, "http": info, "tg": tg, "slot": slot}
+    raise HTTPException(502, f"TGIF API 通信エラー: {info}")
+
+
+def restore_tg_on_startup():
+    """起動時、記録された前回TGを TGIF に投げ直して実態を揃える(best-effort)。"""
+    for name, st in STATES.items():
+        tg = st.current_tg
+        if tg is None:
+            continue
+        dmr_id = (STATION_INFO.get(name) or {}).get("dmr_id")
+        if not dmr_id:
+            continue
+        ok, info = tgif_push(dmr_id, tg, 2)   # 運用は Slot2 固定
+        print(f"[tg-restore] {name}: TG {tg} -> {'OK' if ok else f'FAIL({info})'}")
+
+
+app.mount("/", StaticFiles(directory=Path(__file__).parent / "static", html=True), name="static")
