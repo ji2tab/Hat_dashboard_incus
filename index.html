@@ -42,6 +42,15 @@
   .tag.lost{color:var(--red)}
   .foot{margin-top:16px;color:var(--tx2);font-size:12px;font-family:var(--mono)}
   .err{color:var(--red)}
+  .tgbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:0 0 20px}
+  .tglabel{font-size:12px;color:var(--tx2)}
+  #tgInput{width:120px;background:var(--panel);border:1px solid var(--line);color:var(--tx);
+       border-radius:6px;padding:6px 10px;font-family:var(--mono);font-size:14px}
+  #tgBtn{background:var(--panel);border:1px solid var(--amber);color:var(--amber);
+       border-radius:6px;padding:6px 16px;font-size:14px;cursor:pointer}
+  #tgBtn:disabled{opacity:.5;cursor:default}
+  .tgmsg{font-size:13px;font-family:var(--mono)}
+  .tgmsg.ok{color:var(--green)} .tgmsg.err{color:var(--red)}
 </style>
 </head>
 <body>
@@ -54,6 +63,12 @@
 <main>
   <div class="cards" id="cards"></div>
   <div class="modes" id="modes"></div>
+  <div class="tgbar">
+    <span class="tglabel">TG変更 (Slot2):</span>
+    <input id="tgInput" type="number" inputmode="numeric" placeholder="TG番号" />
+    <button id="tgBtn" onclick="changeTG()">送信</button>
+    <span id="tgMsg" class="tgmsg"></span>
+  </div>
   <h2>Last heard</h2>
   <table>
     <thead><tr>
@@ -139,6 +154,28 @@ async function refresh(){
 }
 
 function tick(){ $("clock").textContent = new Date().toLocaleString("ja-JP"); }
+
+async function changeTG(){
+  if(!current) return;
+  const raw = $("tgInput").value.trim();
+  if(!/^\d+$/.test(raw)){ setTgMsg("TG番号を入力", true); return; }
+  if(!confirm(`${current} を Slot2 → TG ${raw} に変更しますか?`)) return;
+  const btn = $("tgBtn"); btn.disabled = true; setTgMsg("送信中…", false);
+  try{
+    const r = await getJSON(`/api/${current}/set_tg?tg=${raw}&slot=2`);
+    if(r.ok) setTgMsg(`✓ TG ${r.tg} に変更 (HTTP ${r.http})`, false, true);
+    else     setTgMsg(`失敗 (HTTP ${r.http})`, true);
+  }catch(err){
+    setTgMsg("エラー: " + err.message, true);
+  }finally{
+    btn.disabled = false;
+  }
+}
+function setTgMsg(text, isErr, isOk){
+  const el = $("tgMsg");
+  el.textContent = text;
+  el.className = "tgmsg" + (isErr ? " err" : (isOk ? " ok" : ""));
+}
 
 (async function init(){
   tick(); setInterval(tick, 1000);
