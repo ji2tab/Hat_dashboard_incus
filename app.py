@@ -31,7 +31,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 
 CONFIG_PATH = os.environ.get("MMDVM_DASH_CONFIG", "/etc/mmdvm-dash/config.yaml")
-APP_VERSION = "1.6.0"    # 1.6.0: ダッシュからTG変更(TGIF API) / 1.5.0: 履歴永続化ほか
+APP_VERSION = "1.7.0"    # 1.7.0: 現在TG表示(直近受信TG+経過) / 1.6.0: TG変更 / 1.5.0: 履歴永続化ほか
 MAX_HEARD = 100          # インスタンスごとにメモリ保持する Last heard 件数
 ACTIVE_TIMEOUT = 180     # start 後この秒数 end が来なければ宙吊りとみなし掃除(長い交信を巻き込まない値)
 
@@ -206,6 +206,8 @@ class InstanceState:
         self.heard = deque(maxlen=MAX_HEARD)   # 新しいものが先頭
         self.open_tx = {}                       # slot -> 進行中の start 情報
         self.last_msg_at = None                 # 最後に MQTT を受けた時刻(監視用)
+        self.last_tg = None                     # 直近に降ってきた宛先TG(現在TGの近似)
+        self.last_tg_at = None                  # その受信の時刻(epoch秒)
         self.connected = False
         self.error = None
         self.rev = 0                            # heard 変更のたびに増える(保存要否判定用)
@@ -256,6 +258,11 @@ class InstanceState:
         action = d.get("action")
         slot = d.get("slot")
         if action in ("start", "late_entry"):
+            dst = d.get("dst_id")
+            if dst is not None:
+                # 直近に降ってきた宛先TGを「現在TG」として記録(実トラフィックベース)
+                self.last_tg = dst
+                self.last_tg_at = time.time()
             self.open_tx[slot] = {
                 "time": d.get("timestamp", ""),
                 "_mono": time.monotonic(),
@@ -263,7 +270,7 @@ class InstanceState:
                 "source": "RF" if d.get("source") == "rf" else "NET",
                 "src_id": str(d.get("src_id", "")),
                 "callsign": d.get("src_info") or str(d.get("src_id", "?")),
-                "dest": f"TG {d.get('dst_id')}" if d.get("dst_id") is not None else "?",
+                "dest": f"TG {dst}" if dst is not None else "?",
                 "late": action == "late_entry",
             }
         elif action in ("end", "lost"):
@@ -345,6 +352,10 @@ class InstanceState:
                 "connected": self.connected,
                 "active": active,
                 "error": self.error,
+                "current_tg": self.last_tg,
+                "current_tg_age": (
+                    round(time.time() - self.last_tg_at) if self.last_tg_at else None
+                ),
                 "last_msg_ago": (
                     round(time.monotonic() - self.last_msg_at, 1)
                     if self.last_msg_at else None
