@@ -181,13 +181,24 @@ async function changeTG(){
   const btn = $("tgBtn"); btn.disabled = true; setTgMsg("送信中…", false);
   try{
     const r = await getJSON(`/api/${current}/set_tg?tg=${raw}&slot=2`);
-    if(r.ok){ setTgMsg(`✓ TG ${r.tg} に変更 (HTTP ${r.http})`, false, true); refresh(); }
-    else     setTgMsg(`失敗 (HTTP ${r.http})`, true);
+    if(r.ok){
+      $("tgInput").value = "";                 // 成功したら入力欄を空に
+      toastTg(`✓ TG ${r.tg} に変更`);          // 一時表示(自動で消える)
+      refresh();
+    } else {
+      setTgMsg(`失敗 (HTTP ${r.http})`, true);  // 失敗は残す
+    }
   }catch(err){
     setTgMsg("エラー: " + err.message, true);
   }finally{
     btn.disabled = false;
   }
+}
+let tgToastTimer = null;
+function toastTg(text){
+  setTgMsg(text, false, true);
+  clearTimeout(tgToastTimer);
+  tgToastTimer = setTimeout(() => setTgMsg("", false), 2500);  // 2.5秒で消す
 }
 function setTgMsg(text, isErr, isOk){
   const el = $("tgMsg");
