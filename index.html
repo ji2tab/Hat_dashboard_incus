@@ -107,6 +107,20 @@ function freq(hz){
   return isNaN(n) ? hz : (n/1e6).toFixed(4);
 }
 
+function agoText(sec){
+  if(sec == null) return "";
+  if(sec < 60)   return `${sec}秒前`;
+  if(sec < 3600) return `${Math.floor(sec/60)}分前`;
+  if(sec < 86400)return `${Math.floor(sec/3600)}時間前`;
+  return `${Math.floor(sec/86400)}日前`;
+}
+function tgText(st){
+  if(st.current_tg == null) return '<span style="color:var(--tx2)">–</span>';
+  const age = agoText(st.current_tg_age);
+  return `TG ${esc(st.current_tg)}` +
+    (age ? `<span style="color:var(--tx2);font-size:12px"> / ${age}</span>` : "");
+}
+
 function stateCard(st){
   if(!st.connected) return {cls:"red", text:"未接続"};
   if(st.active)     return {cls:"amber", text:`受信中 ${st.active.callsign}`};
@@ -124,6 +138,7 @@ async function refresh(){
     const info = st.info || {};
     $("cards").innerHTML = `
       <div class="card"><div class="k">状態</div><div class="v ${s.cls}">${esc(s.text)}</div></div>
+      <div class="card"><div class="k">現在TG (直近受信)</div><div class="v">${tgText(st)}</div></div>
       <div class="card"><div class="k">コールサイン</div><div class="v">${esc(info.callsign ?? "–")}</div></div>
       <div class="card"><div class="k">周波数 RX/TX</div><div class="v">${esc(freq(info.rx_freq))}<span style="color:var(--tx2)"> / </span>${esc(freq(info.tx_freq))}</div></div>
       <div class="card"><div class="k">DMR ID</div><div class="v">${esc(info.dmr_id ?? "–")}</div></div>`;
