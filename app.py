@@ -31,7 +31,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 
 CONFIG_PATH = os.environ.get("MMDVM_DASH_CONFIG", "/etc/mmdvm-dash/config.yaml")
-APP_VERSION = "1.9.0"    # 1.9.0: 起動時に前回TGをTGIFへ投げ直し / 1.8.0: 現在TG永続化+受信追従 / 1.6.0: TG変更
+APP_VERSION = "1.9.1"    # 1.9.1: TG変更UX(入力クリア+トースト) / 1.9.0: 起動時TG投げ直し
 MAX_HEARD = 100          # インスタンスごとにメモリ保持する Last heard 件数
 ACTIVE_TIMEOUT = 180     # start 後この秒数 end が来なければ宙吊りとみなし掃除(長い交信を巻き込まない値)
 
