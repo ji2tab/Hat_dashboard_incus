@@ -31,7 +31,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 
 CONFIG_PATH = os.environ.get("MMDVM_DASH_CONFIG", "/etc/mmdvm-dash/config.yaml")
-APP_VERSION = "1.7.0"    # 1.7.0: 現在TG表示(直近受信TG+経過) / 1.6.0: TG変更 / 1.5.0: 履歴永続化ほか
+APP_VERSION = "1.9.0"    # 1.9.0: 起動時に前回TGをTGIFへ投げ直し / 1.8.0: 現在TG永続化+受信追従 / 1.6.0: TG変更
 MAX_HEARD = 100          # インスタンスごとにメモリ保持する Last heard 件数
 ACTIVE_TIMEOUT = 180     # start 後この秒数 end が来なければ宙吊りとみなし掃除(長い交信を巻き込まない値)
 
@@ -206,18 +206,23 @@ class InstanceState:
         self.heard = deque(maxlen=MAX_HEARD)   # 新しいものが先頭
         self.open_tx = {}                       # slot -> 進行中の start 情報
         self.last_msg_at = None                 # 最後に MQTT を受けた時刻(監視用)
-        self.last_tg = None                     # 直近に降ってきた宛先TG(現在TGの近似)
-        self.last_tg_at = None                  # その受信の時刻(epoch秒)
+        self.current_tg = None                  # 現在TG(ダッシュ設定 or 受信で確定)
+        self.current_tg_src = None              # "set"(ダッシュ設定) / "rx"(受信)
+        self.current_tg_at = None               # 確定時刻(epoch秒)
         self.connected = False
         self.error = None
         self.rev = 0                            # heard 変更のたびに増える(保存要否判定用)
         self.lock = threading.Lock()
         self._load_history()
+        self._load_tg()
 
     # ---- 履歴の永続化 -----------------------------------------------
 
     def _history_path(self):
         return os.path.join(HISTORY_DIR, f"{self.name}.json")
+
+    def _tg_path(self):
+        return os.path.join(HISTORY_DIR, f"{self.name}.tg.json")
 
     def _load_history(self):
         """起動時にディスクから直近履歴を読み戻す。失敗しても無視。"""
@@ -229,6 +234,36 @@ class InstanceState:
                 self.heard = deque(data[:MAX_HEARD], maxlen=MAX_HEARD)
         except (OSError, ValueError):
             pass
+
+    def _load_tg(self):
+        """起動時に前回の現在TGを読み戻す(再起動しても前回TGから開始)。"""
+        try:
+            with open(self._tg_path(), encoding="utf-8") as f:
+                d = json.load(f)
+            self.current_tg = d.get("tg")
+            self.current_tg_src = d.get("src")
+            self.current_tg_at = d.get("at")
+        except (OSError, ValueError):
+            pass
+
+    def _save_tg(self):
+        """現在TGを永続化(原子的書き込み)。"""
+        try:
+            os.makedirs(HISTORY_DIR, exist_ok=True)
+            tmp = self._tg_path() + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"tg": self.current_tg, "src": self.current_tg_src,
+                           "at": self.current_tg_at}, f)
+            os.replace(tmp, self._tg_path())
+        except OSError:
+            pass
+
+    def set_current_tg(self, tg, src):
+        """現在TGを更新して永続化。src は 'set' か 'rx'。"""
+        self.current_tg = int(tg)
+        self.current_tg_src = src
+        self.current_tg_at = time.time()
+        self._save_tg()
 
     def save_history(self):
         """heard の先頭 HISTORY_KEEP 件を JSON で原子的に書き出す。"""
@@ -259,10 +294,9 @@ class InstanceState:
         slot = d.get("slot")
         if action in ("start", "late_entry"):
             dst = d.get("dst_id")
-            if dst is not None:
-                # 直近に降ってきた宛先TGを「現在TG」として記録(実トラフィックベース)
-                self.last_tg = dst
-                self.last_tg_at = time.time()
+            if dst is not None and dst != self.current_tg:
+                # 受信TGが現在TGと違う → ネット側で変わった可能性。受信TGで追従。
+                self.set_current_tg(dst, "rx")
             self.open_tx[slot] = {
                 "time": d.get("timestamp", ""),
                 "_mono": time.monotonic(),
@@ -352,9 +386,10 @@ class InstanceState:
                 "connected": self.connected,
                 "active": active,
                 "error": self.error,
-                "current_tg": self.last_tg,
+                "current_tg": self.current_tg,
+                "current_tg_src": self.current_tg_src,
                 "current_tg_age": (
-                    round(time.time() - self.last_tg_at) if self.last_tg_at else None
+                    round(time.time() - self.current_tg_at) if self.current_tg_at else None
                 ),
                 "last_msg_ago": (
                     round(time.monotonic() - self.last_msg_at, 1)
@@ -553,6 +588,8 @@ def start_subscribers():
     threading.Thread(target=dmr_db_updater, daemon=True).start()
     threading.Thread(target=station_info_refresher, daemon=True).start()
     threading.Thread(target=history_flusher, daemon=True).start()
+    # 起動時、記録された前回TGを TGIF に投げ直す(別スレッドで。失敗しても起動は続行)
+    threading.Thread(target=restore_tg_on_startup, daemon=True).start()
 
 
 # ---------------------------------------------------------------- API
@@ -602,10 +639,24 @@ TGIF_API = CFG.get("tgif_api", "http://tgif.network:5040/api/sessions/update").r
 TGIF_API_TIMEOUT = float(CFG.get("tgif_api_timeout", 10))
 
 
-@app.get("/api/{name}/set_tg")
-def api_set_tg(name: str, tg: int, slot: int = 2):
+def tgif_push(dmr_id, tg: int, slot: int = 2):
+    """TGIF API に TG 設定を GET で投げる。(ok, http/理由) を返す。例外は投げない。"""
     import urllib.request
     import urllib.error
+    url = f"{TGIF_API}/{dmr_id}/{slot - 1}/{tg}"
+    try:
+        req = urllib.request.Request(url, method="GET",
+                                     headers={"User-Agent": "mmdvm-dash"})
+        with urllib.request.urlopen(req, timeout=TGIF_API_TIMEOUT) as res:
+            return (200 <= res.status < 300), res.status
+    except urllib.error.HTTPError as e:
+        return False, e.code
+    except (urllib.error.URLError, OSError) as e:
+        return False, str(getattr(e, "reason", e))
+
+
+@app.get("/api/{name}/set_tg")
+def api_set_tg(name: str, tg: int, slot: int = 2):
     st = get_state(name)
     dmr_id = (STATION_INFO.get(name) or {}).get("dmr_id")
     if not dmr_id:
@@ -614,18 +665,26 @@ def api_set_tg(name: str, tg: int, slot: int = 2):
         raise HTTPException(400, "slot must be 1 or 2")
     if tg < 0:
         raise HTTPException(400, "invalid tg")
-    url = f"{TGIF_API}/{dmr_id}/{slot - 1}/{tg}"
-    try:
-        req = urllib.request.Request(url, method="GET",
-                                     headers={"User-Agent": "mmdvm-dash"})
-        with urllib.request.urlopen(req, timeout=TGIF_API_TIMEOUT) as res:
-            ok = 200 <= res.status < 300
-            return {"ok": ok, "http": res.status, "tg": tg, "slot": slot,
-                    "dmr_id": dmr_id}
-    except urllib.error.HTTPError as e:
-        return {"ok": False, "http": e.code, "tg": tg, "slot": slot}
-    except (urllib.error.URLError, OSError) as e:
-        raise HTTPException(502, f"TGIF API 通信エラー: {getattr(e, 'reason', e)}")
+    ok, info = tgif_push(dmr_id, tg, slot)
+    if ok:
+        st.set_current_tg(tg, "set")   # ダッシュ設定を現在TGとして即反映+永続化
+        return {"ok": True, "http": info, "tg": tg, "slot": slot, "dmr_id": dmr_id}
+    if isinstance(info, int):
+        return {"ok": False, "http": info, "tg": tg, "slot": slot}
+    raise HTTPException(502, f"TGIF API 通信エラー: {info}")
+
+
+def restore_tg_on_startup():
+    """起動時、記録された前回TGを TGIF に投げ直して実態を揃える(best-effort)。"""
+    for name, st in STATES.items():
+        tg = st.current_tg
+        if tg is None:
+            continue
+        dmr_id = (STATION_INFO.get(name) or {}).get("dmr_id")
+        if not dmr_id:
+            continue
+        ok, info = tgif_push(dmr_id, tg, 2)   # 運用は Slot2 固定
+        print(f"[tg-restore] {name}: TG {tg} -> {'OK' if ok else f'FAIL({info})'}")
 
 
 app.mount("/", StaticFiles(directory=Path(__file__).parent / "static", html=True), name="static")
