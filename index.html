@@ -116,9 +116,12 @@ function agoText(sec){
 }
 function tgText(st){
   if(st.current_tg == null) return '<span style="color:var(--tx2)">–</span>';
-  const age = agoText(st.current_tg_age);
-  return `TG ${esc(st.current_tg)}` +
-    (age ? `<span style="color:var(--tx2);font-size:12px"> / ${age}</span>` : "");
+  let note = "";
+  if(st.current_tg_src === "rx"){
+    const age = agoText(st.current_tg_age);
+    note = `<span style="color:var(--tx2);font-size:12px"> / 受信${age?" "+age:""}</span>`;
+  }
+  return `TG ${esc(st.current_tg)}` + note;
 }
 
 function stateCard(st){
@@ -178,7 +181,7 @@ async function changeTG(){
   const btn = $("tgBtn"); btn.disabled = true; setTgMsg("送信中…", false);
   try{
     const r = await getJSON(`/api/${current}/set_tg?tg=${raw}&slot=2`);
-    if(r.ok) setTgMsg(`✓ TG ${r.tg} に変更 (HTTP ${r.http})`, false, true);
+    if(r.ok){ setTgMsg(`✓ TG ${r.tg} に変更 (HTTP ${r.http})`, false, true); refresh(); }
     else     setTgMsg(`失敗 (HTTP ${r.http})`, true);
   }catch(err){
     setTgMsg("エラー: " + err.message, true);
