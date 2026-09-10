@@ -31,9 +31,13 @@ from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 
 CONFIG_PATH = os.environ.get("MMDVM_DASH_CONFIG", "/etc/mmdvm-dash/config.yaml")
-APP_VERSION = "1.9.1"    # 1.9.1: TG変更UX(入力クリア+トースト) / 1.9.0: 起動時TG投げ直し
+APP_VERSION = "1.10.0"   # 1.10.0: YSF対応 / 1.9.1: TG変更UX / 1.9.0: 起動時TG投げ直し
 MAX_HEARD = 100          # インスタンスごとにメモリ保持する Last heard 件数
 ACTIVE_TIMEOUT = 180     # start 後この秒数 end が来なければ宙吊りとみなし掃除(長い交信を巻き込まない値)
+
+# YSF は slot 概念が無いため、open_tx 内では固定キーで1ストリームを管理する。
+# DMR の slot(1/2)とは衝突しない。
+YSF_KEY = "YSF"
 
 app = FastAPI(title="mmdvm-dash", version=APP_VERSION)
 
@@ -285,9 +289,11 @@ class InstanceState:
             self.last_msg_at = time.monotonic()
             if "DMR" in payload:
                 self._dmr(payload["DMR"])
+            elif "YSF" in payload:
+                self._ysf(payload["YSF"])
             elif "Text" in payload:
                 self._text(payload["Text"])
-            # 他モード(YSF/D-Star 等)も同様の形なら将来ここに追加
+            # 他モード(D-Star 等)も同様の形なら将来ここに追加
 
     def _dmr(self, d: dict):
         action = d.get("action")
@@ -331,10 +337,67 @@ class InstanceState:
                 self.heard.appendleft(entry)
             self.rev += 1
 
+    def _ysf(self, d: dict):
+        """YSF (System Fusion) イベントを処理する。
+        DMR と違い slot が無い(YSF_KEY 固定)、src_callsign が直接来る、
+        宛先は reflector(無ければ DG-ID)という差がある。
+        end に src_callsign が無いため start で覚えた値を引き継ぐ。"""
+        action = d.get("action")
+        if action in ("start", "late_entry"):
+            call = (d.get("src_callsign") or "").strip()
+            reflector = (d.get("reflector") or "").strip()
+            dgid = d.get("dg-id")
+            # 宛先は reflector 優先。無ければ DG-ID 表記。
+            if reflector:
+                dest = reflector
+            elif dgid is not None:
+                dest = f"DG-ID {dgid}"
+            else:
+                dest = "?"
+            self.open_tx[YSF_KEY] = {
+                "time": d.get("timestamp", ""),
+                "_mono": time.monotonic(),
+                "mode": "YSF",
+                "source": "RF" if d.get("source") == "rf" else "NET",
+                "src_id": "",                        # YSF は数値IDを持たない
+                "callsign": call or "?",             # コールサイン直接(DB解決不要)
+                "dest": dest,
+                "late": action == "late_entry",
+            }
+        elif action in ("end", "lost"):
+            entry = self.open_tx.pop(YSF_KEY, None)
+            append_needed = entry is not None
+            if entry is None:
+                # start を取りこぼした end。直近の swept を探す(YSF は mode=="YSF")
+                entry = self._recent_swept_ysf()
+            if entry is None:
+                entry = {
+                    "time": d.get("timestamp", ""), "mode": "YSF",
+                    "source": "", "src_id": "", "callsign": "?", "dest": "?",
+                    "alias": "", "late": False,
+                }
+                append_needed = True
+            entry["duration"] = d.get("duration")
+            entry["ber"] = d.get("ber")             # network 由来の end には無い(None)
+            entry["loss"] = d.get("loss")           # RF 由来の end には無い(None)
+            entry["lost"] = (action == "lost")
+            entry["swept"] = False
+            entry["ended"] = d.get("timestamp", "")
+            if append_needed:
+                self.heard.appendleft(entry)
+            self.rev += 1
+
     def _recent_swept(self, slot):
         """タイムアウトで先に落とした未確定エントリを直近から探す(同一 slot)。"""
         for e in list(self.heard)[:5]:
             if e.get("swept") and e.get("mode", "").endswith(f"TS{slot}"):
+                return e
+        return None
+
+    def _recent_swept_ysf(self):
+        """YSF 用: タイムアウトで先に落とした未確定エントリを直近から探す。"""
+        for e in list(self.heard)[:5]:
+            if e.get("swept") and e.get("mode") == "YSF":
                 return e
         return None
 
@@ -378,7 +441,7 @@ class InstanceState:
                     self.rev += 1
                     continue
                 active = {
-                    "callsign": format_callsign(tx.get("src_id"), tx.get("alias")),
+                    "callsign": self._active_call(tx),
                     "dest": tx["dest"],
                     "mode": tx["mode"], "source": tx["source"],
                 }
@@ -397,17 +460,33 @@ class InstanceState:
                 ),
             }
 
+    @staticmethod
+    def _active_call(tx):
+        """進行中エントリの表示コールサイン。YSF は callsign 直接、DMR は src_id 解決。"""
+        if tx.get("mode") == "YSF":
+            return tx.get("callsign") or "?"
+        return format_callsign(tx.get("src_id"), tx.get("alias"))
+
     def snapshot_heard(self, limit: int):
         with self.lock:
             out = []
             for e in list(self.heard)[:limit]:
-                rec = resolve_full(e.get("src_id"))
+                # YSF は src_callsign 直接なので DB 解決せず callsign をそのまま使う。
+                if e.get("mode") == "YSF":
+                    callsign = e.get("callsign") or "?"
+                    name = ""
+                    loc = ""
+                else:
+                    rec = resolve_full(e.get("src_id"))
+                    callsign = format_callsign(e.get("src_id"), e.get("alias"))
+                    name = (rec or {}).get("name", "")
+                    loc = (rec or {}).get("loc", "")
                 out.append({
                     "time": fmt_time(e.get("ended") or e.get("time")),
                     "mode": e["mode"], "source": e["source"],
-                    "callsign": format_callsign(e.get("src_id"), e.get("alias")),
-                    "name": (rec or {}).get("name", ""),
-                    "loc": (rec or {}).get("loc", ""),
+                    "callsign": callsign,
+                    "name": name,
+                    "loc": loc,
                     "dest": e["dest"],
                     "duration": (
                         round(e["duration"], 1) if isinstance(e.get("duration"), (int, float)) else None
