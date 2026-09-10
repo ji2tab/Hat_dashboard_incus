@@ -42,17 +42,33 @@
   .tag.lost{color:var(--red)}
   .foot{margin-top:16px;color:var(--tx2);font-size:12px;font-family:var(--mono)}
   .err{color:var(--red)}
+  .tgbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:0 0 20px}
+  .tglabel{font-size:12px;color:var(--tx2)}
+  #tgInput{width:120px;background:var(--panel);border:1px solid var(--line);color:var(--tx);
+       border-radius:6px;padding:6px 10px;font-family:var(--mono);font-size:14px}
+  #tgBtn{background:var(--panel);border:1px solid var(--amber);color:var(--amber);
+       border-radius:6px;padding:6px 16px;font-size:14px;cursor:pointer}
+  #tgBtn:disabled{opacity:.5;cursor:default}
+  .tgmsg{font-size:13px;font-family:var(--mono)}
+  .tgmsg.ok{color:var(--green)} .tgmsg.err{color:var(--red)}
 </style>
 </head>
 <body>
 <header>
   <h1>MMDVM DASH</h1>
+  <span class="sub" id="ver"></span>
   <span class="sub" id="clock"></span>
 </header>
 <nav id="tabs"></nav>
 <main>
   <div class="cards" id="cards"></div>
   <div class="modes" id="modes"></div>
+  <div class="tgbar">
+    <span class="tglabel">TG変更 (Slot2):</span>
+    <input id="tgInput" type="number" inputmode="numeric" placeholder="TG番号" />
+    <button id="tgBtn" onclick="changeTG()">送信</button>
+    <span id="tgMsg" class="tgmsg"></span>
+  </div>
   <h2>Last heard</h2>
   <table>
     <thead><tr>
@@ -91,6 +107,23 @@ function freq(hz){
   return isNaN(n) ? hz : (n/1e6).toFixed(4);
 }
 
+function agoText(sec){
+  if(sec == null) return "";
+  if(sec < 60)   return `${sec}秒前`;
+  if(sec < 3600) return `${Math.floor(sec/60)}分前`;
+  if(sec < 86400)return `${Math.floor(sec/3600)}時間前`;
+  return `${Math.floor(sec/86400)}日前`;
+}
+function tgText(st){
+  if(st.current_tg == null) return '<span style="color:var(--tx2)">–</span>';
+  let note = "";
+  if(st.current_tg_src === "rx"){
+    const age = agoText(st.current_tg_age);
+    note = `<span style="color:var(--tx2);font-size:12px"> / 受信${age?" "+age:""}</span>`;
+  }
+  return `TG ${esc(st.current_tg)}` + note;
+}
+
 function stateCard(st){
   if(!st.connected) return {cls:"red", text:"未接続"};
   if(st.active)     return {cls:"amber", text:`受信中 ${st.active.callsign}`};
@@ -108,6 +141,7 @@ async function refresh(){
     const info = st.info || {};
     $("cards").innerHTML = `
       <div class="card"><div class="k">状態</div><div class="v ${s.cls}">${esc(s.text)}</div></div>
+      <div class="card"><div class="k">現在TG (直近受信)</div><div class="v">${tgText(st)}</div></div>
       <div class="card"><div class="k">コールサイン</div><div class="v">${esc(info.callsign ?? "–")}</div></div>
       <div class="card"><div class="k">周波数 RX/TX</div><div class="v">${esc(freq(info.rx_freq))}<span style="color:var(--tx2)"> / </span>${esc(freq(info.tx_freq))}</div></div>
       <div class="card"><div class="k">DMR ID</div><div class="v">${esc(info.dmr_id ?? "–")}</div></div>`;
@@ -139,10 +173,44 @@ async function refresh(){
 
 function tick(){ $("clock").textContent = new Date().toLocaleString("ja-JP"); }
 
+async function changeTG(){
+  if(!current) return;
+  const raw = $("tgInput").value.trim();
+  if(!/^\d+$/.test(raw)){ setTgMsg("TG番号を入力", true); return; }
+  if(!confirm(`${current} を Slot2 → TG ${raw} に変更しますか?`)) return;
+  const btn = $("tgBtn"); btn.disabled = true; setTgMsg("送信中…", false);
+  try{
+    const r = await getJSON(`/api/${current}/set_tg?tg=${raw}&slot=2`);
+    if(r.ok){
+      $("tgInput").value = "";                 // 成功したら入力欄を空に
+      toastTg(`✓ TG ${r.tg} に変更`);          // 一時表示(自動で消える)
+      refresh();
+    } else {
+      setTgMsg(`失敗 (HTTP ${r.http})`, true);  // 失敗は残す
+    }
+  }catch(err){
+    setTgMsg("エラー: " + err.message, true);
+  }finally{
+    btn.disabled = false;
+  }
+}
+let tgToastTimer = null;
+function toastTg(text){
+  setTgMsg(text, false, true);
+  clearTimeout(tgToastTimer);
+  tgToastTimer = setTimeout(() => setTgMsg("", false), 2500);  // 2.5秒で消す
+}
+function setTgMsg(text, isErr, isOk){
+  const el = $("tgMsg");
+  el.textContent = text;
+  el.className = "tgmsg" + (isErr ? " err" : (isOk ? " ok" : ""));
+}
+
 (async function init(){
   tick(); setInterval(tick, 1000);
   try{
     const data = await getJSON("/api/instances");
+    if (data.version) $("ver").textContent = "v" + data.version;
     instances = data.instances;
     current = instances[0]?.name ?? null;
     renderTabs();
