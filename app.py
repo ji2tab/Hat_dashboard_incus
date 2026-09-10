@@ -31,7 +31,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 
 CONFIG_PATH = os.environ.get("MMDVM_DASH_CONFIG", "/etc/mmdvm-dash/config.yaml")
-APP_VERSION = "1.5.0"    # 1.5.0: 履歴永続化 / info定期再読込 / lost対応 / alias併記 / DB解決 / JST
+APP_VERSION = "1.6.0"    # 1.6.0: ダッシュからTG変更(TGIF API) / 1.5.0: 履歴永続化ほか
 MAX_HEARD = 100          # インスタンスごとにメモリ保持する Last heard 件数
 ACTIVE_TIMEOUT = 180     # start 後この秒数 end が来なければ宙吊りとみなし掃除(長い交信を巻き込まない値)
 
@@ -583,6 +583,38 @@ def api_status(name: str):
 def api_lastheard(name: str, limit: int = 20):
     st = get_state(name)
     return {"lastheard": st.snapshot_heard(max(1, min(limit, MAX_HEARD)))}
+
+
+# TGIF の HTTP API で TG を変更する(TGIFChanger と同じ方式)。
+# GET {tgif_api}/{dmr_id}/{slot_idx}/{tg}   slot_idx: Slot1=0, Slot2=1
+TGIF_API = CFG.get("tgif_api", "http://tgif.network:5040/api/sessions/update").rstrip("/")
+TGIF_API_TIMEOUT = float(CFG.get("tgif_api_timeout", 10))
+
+
+@app.get("/api/{name}/set_tg")
+def api_set_tg(name: str, tg: int, slot: int = 2):
+    import urllib.request
+    import urllib.error
+    st = get_state(name)
+    dmr_id = (STATION_INFO.get(name) or {}).get("dmr_id")
+    if not dmr_id:
+        raise HTTPException(400, "DMR ID unknown (ini 未取得)")
+    if slot not in (1, 2):
+        raise HTTPException(400, "slot must be 1 or 2")
+    if tg < 0:
+        raise HTTPException(400, "invalid tg")
+    url = f"{TGIF_API}/{dmr_id}/{slot - 1}/{tg}"
+    try:
+        req = urllib.request.Request(url, method="GET",
+                                     headers={"User-Agent": "mmdvm-dash"})
+        with urllib.request.urlopen(req, timeout=TGIF_API_TIMEOUT) as res:
+            ok = 200 <= res.status < 300
+            return {"ok": ok, "http": res.status, "tg": tg, "slot": slot,
+                    "dmr_id": dmr_id}
+    except urllib.error.HTTPError as e:
+        return {"ok": False, "http": e.code, "tg": tg, "slot": slot}
+    except (urllib.error.URLError, OSError) as e:
+        raise HTTPException(502, f"TGIF API 通信エラー: {getattr(e, 'reason', e)}")
 
 
 app.mount("/", StaticFiles(directory=Path(__file__).parent / "static", html=True), name="static")
