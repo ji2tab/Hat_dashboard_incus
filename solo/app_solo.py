@@ -27,7 +27,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import yaml
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
 
 CONFIG_PATH = os.environ.get("MMDVM_DASH_CONFIG", "/etc/mmdvm-dash/config.yaml")
@@ -653,8 +653,27 @@ def tgif_push(dmr_id, tg: int, slot: int = 2):
         return False, str(getattr(e, "reason", e))
 
 
+def _deny_cross_site(request: Request) -> None:
+    """🔴 CSRF 対策（監査 2026-10）
+
+    本 API は認証を持たず、TG 変更が GET で実行できる。そのため運用者の
+    ブラウザが外部の悪意あるページを開くと、<img src=".../set_tg?tg=..."> の
+    一行だけで TG を変えられてしまう（LAN 限定では防げない）。
+    画面(static/index.html)からの fetch は same-origin なので影響しない。
+    """
+    site = request.headers.get("sec-fetch-site")
+    if site is not None and site not in ("same-origin", "none"):
+        raise HTTPException(403, "cross-site request denied")
+    origin = request.headers.get("origin")
+    if origin is not None:
+        from urllib.parse import urlparse
+        if urlparse(origin).netloc != (request.headers.get("host") or ""):
+            raise HTTPException(403, "cross-origin request denied")
+
+
 @app.get("/api/{name}/set_tg")
-def api_set_tg(name: str, tg: int, slot: int = 2):
+def api_set_tg(name: str, tg: int, request: Request, slot: int = 2):
+    _deny_cross_site(request)
     st = get_state(name)
     dmr_id = (STATION_INFO.get(name) or {}).get("dmr_id")
     if not dmr_id:
